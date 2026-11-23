@@ -1,0 +1,40 @@
+name: preuves-pki
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "full = Vault + ACME + OpenSSL ; offline = OpenSSL + Python seulement"
+        default: "full"
+        type: choice
+        options: [full, offline]
+  push:
+    branches: [main]
+
+jobs:
+  preuves:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Construire l'image
+        run: docker build -t pki-lab .
+
+      - name: Exécuter les tests (les sorties brutes s'affichent dans ce journal)
+        run: |
+          mkdir -p out
+          docker run --rm -e MODE="${{ inputs.mode || 'full' }}" -v "$PWD/out:/out" pki-lab
+
+      - name: Résumé du run
+        if: always()
+        run: |
+          echo "## Résultats des tests" >> "$GITHUB_STEP_SUMMARY"
+          cat out/RESULTATS.md >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Enregistrer les journaux bruts (T01.log, T05.log, ...)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preuves-pki
+          path: out/
