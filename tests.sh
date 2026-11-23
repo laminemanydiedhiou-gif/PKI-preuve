@@ -3,6 +3,8 @@
 # Complet  : docker run --rm -v "$PWD/out:/out" pki-lab
 # Hors ligne (OpenSSL + Python seulement) : MODE=offline OUT=./out LAB=./lab bash tests.sh
 set -u
+echo "tests.sh : $(wc -l < "$0") lignes, empreinte sha256 = $(sha256sum "$0" | cut -c1-12)"
+if bash -n "$0"; then echo "controle de syntaxe de tests.sh : OK"; else echo "ERREUR DE SYNTAXE dans tests.sh (voir la ligne indiquee ci-dessus) : le fichier a ete mal copie"; fi
 MODE=${MODE:-full}
 OUT=${OUT:-/out}
 LAB=${LAB:-/lab}
@@ -162,13 +164,14 @@ EOF
   cmd "vault write pki_int/config/urls issuing_certificates=https://vault.lab.local:8200/v1/pki_int/ca crl_distribution_points=https://vault.lab.local:8200/v1/pki_int/crl ocsp_servers=https://vault.lab.local:8200/v1/pki_int/ocsp"
   cmd "vault write pki_int/config/cluster path=https://vault.lab.local:8200/v1/pki_int aia_path=https://vault.lab.local:8200/v1/pki_int"
   cmd "vault write pki_int/roles/lab-acme allowed_domains=lab.local allow_subdomains=true key_type=any ttl=720h max_ttl=720h require_cn=false"
+  cmd "vault write pki_int/roles/lab-issue allowed_domains=lab.local allow_subdomains=true key_type=ec key_bits=256 ttl=720h max_ttl=720h"
   cmd "vault write pki_int/config/acme enabled=true default_directory_policy=role:lab-acme"
   cmd "vault read pki_int/config/acme"
 
   # ---------------------------------------------------------------- T03 / T04
   begin T03 "Émission d'un certificat via l'API Vault (CLI)" "Certificat, clé et chaîne retournés en moins d'une seconde"
   t0=$(date +%s.%N)
-  cmd "vault write -format=json pki_int/issue/lab-acme common_name=app.lab.local ttl=24h > $LAB/issue.json && jq -r '.data.serial_number, .data.expiration' $LAB/issue.json"
+  cmd "vault write -format=json pki_int/issue/lab-issue common_name=app.lab.local ttl=24h > $LAB/issue.json && jq -r '.data.serial_number, .data.expiration' $LAB/issue.json"
   rc=$?; t1=$(date +%s.%N)
   dur=$(python3 -c "print(round(($t1-$t0)*1000))")
   jq -r .data.certificate "$LAB/issue.json" > "$LAB/vault-leaf.pem"
@@ -176,9 +179,10 @@ EOF
   verdict T03 $rc "émission réussie en ${dur} ms (une mesure ; le mémoire annonce une moyenne, à refaire sur plusieurs essais)"
 
   begin T04 "Respect du rôle Vault (domaine hors périmètre)" "Refus de l'émission pour un domaine hors lab.local"
-  cmd "vault write pki_int/issue/lab-acme common_name=app.example.com ttl=24h"
-  if [ $? -ne 0 ] && echo "$LAST_OUT" | grep -qi 'not allowed'; then rc=0; else rc=1; fi
-  verdict T04 $rc "émission refusée par le rôle (common name non autorisé)"
+  log "Témoin positif : T03 vient d'émettre app.lab.local avec le même rôle (lab-issue) : le refus ci-dessous vient donc bien du nom de domaine."
+  cmd "vault write pki_int/issue/lab-issue common_name=app.example.com ttl=24h"
+  if [ $? -ne 0 ] && echo "$LAST_OUT" | grep -qi 'not allowed by this role'; then rc=0; else rc=1; fi
+  verdict T04 $rc "émission refusée par le rôle pour un domaine hors lab.local (message : not allowed by this role)"
 
   # ---------------------------------------------------------------- T05 ACME + Certbot + nginx
   begin T05 "Émission ACME via Certbot contre Vault" "Certificat obtenu via le protocole ACME (défi HTTP-01) et configuré automatiquement sur nginx"
@@ -204,11 +208,12 @@ EOF
   RC=/etc/letsencrypt/renewal/web.lab.local.conf
   [ -f "$RC" ] && sed -i '1i renew_before_expiry = 10 days' "$RC"
   begin T06 "Renouvellement automatique (dry-run) et fenêtre de renouvellement" "Simulation sans erreur ; pas de renouvellement tant que >10 jours restent (certificat de 30 jours)"
-  cmd "certbot renew --dry-run"
+  log "NOTE : sans --server, 'certbot renew --dry-run' vise le serveur staging de Let's Encrypt (échec constaté au premier essai) ; on force donc le serveur Vault."
+  cmd "certbot renew --dry-run --server https://vault.lab.local:8200/v1/pki_int/acme/directory"
   rc=$?
   cmd "certbot renew"
-  if echo "$LAST_OUT" | grep -qi 'not yet due'; then log "Constat : certbot renew ne renouvelle pas (échéance > 10 jours) -> plus de renouvellement à chaque exécution."; fi
-  verdict T06 $rc "dry-run réussi ; fenêtre de renouvellement fixée à 10 jours (renew_before_expiry)"
+  if echo "$LAST_OUT" | grep -qi 'not yet due'; then nd=0; log "Constat : certbot renew ne renouvelle pas (échéance > 10 jours) -> plus de renouvellement à chaque exécution."; else nd=1; fi
+  [ $rc -eq 0 ] && [ $nd -eq 0 ]; verdict T06 $? "dry-run réussi contre Vault ; fenêtre de renouvellement de 10 jours : pas de renouvellement tant que >10 j restent"
 
   begin T07 "Renouvellement automatique réel (cycles accélérés)" "7 renouvellements successifs avec changement de numéro de série"
   log "LIMITE : cycles forcés (--force-renewal) en quelques secondes ; ce test ne prouve PAS un fonctionnement sur 7 jours."
@@ -320,4 +325,118 @@ if command -v promtool >/dev/null; then
   cmd "cd $LAB/prom && promtool test rules test.yml"
   verdict T11 $? "règle <7 j testée : 6 j -> alerte warning ; 20 j -> aucune alerte (test unitaire promtool ; Grafana/Alertmanager non rejoués)"
 else
-  log "promtool absent 
+  log "promtool absent de cet environnement : test non exécuté."; printf '| T11 | NON EXÉCUTÉ | promtool absent |\n' >> "$RES"
+fi
+
+# ================================================================ T12 / T13 - interception (simulation de redirection)
+begin T12 "Interception MITM - certificat auto-signé" "Montrer qu'un utilisateur qui contourne l'avertissement est vulnérable"
+log "Topologie (3 rôles distincts) : SERVEUR légitime = openssl s_server :9703 (certificat signé par la racine) ;"
+log "ATTAQUANT = openssl s_server :9701 (certificat auto-signé) et :9702 (certificat d'une fausse AC) ; VICTIME = curl."
+log "La redirection du trafic est SIMULÉE par curl --connect-to (équivalent d'un détournement DNS/ARP) ; aucun ARP spoofing n'est réalisé."
+M="$LAB/mitm"; mkdir -p "$M"
+emettre_depuis root legit web.lab.local "DNS:web.lab.local" -days 30; mv "$LAB"/legit.* "$M"/
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout "$M/att-auto.key" -out "$M/att-auto.pem" -days 30 -subj "/CN=web.lab.local" -addext "subjectAltName=DNS:web.lab.local" 2>/dev/null
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout "$M/rogue-ca.key" -out "$M/rogue-ca.pem" -days 30 -subj "/CN=Fausse AC" -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign" 2>/dev/null
+openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout "$M/att-rogue.key" -out "$M/att-rogue.csr" -subj "/CN=web.lab.local" 2>/dev/null
+printf 'subjectAltName=DNS:web.lab.local\nbasicConstraints=CA:FALSE\n' > "$M/ext.cnf"
+openssl x509 -req -in "$M/att-rogue.csr" -CA "$M/rogue-ca.pem" -CAkey "$M/rogue-ca.key" -CAcreateserial -days 30 -extfile "$M/ext.cnf" -out "$M/att-rogue.pem" 2>/dev/null
+serveur_tls 9703 "$M/legit.pem" "$M/legit.key"
+serveur_tls 9701 "$M/att-auto.pem" "$M/att-auto.key"
+serveur_tls 9702 "$M/att-rogue.pem" "$M/att-rogue.key"
+cmd "curl -sS --cacert $LAB/root/root.pem --connect-to web.lab.local:9703:127.0.0.1:9703 https://web.lab.local:9703/ -o /dev/null -w 'HTTP %{http_code}\n'"
+log "(témoin : sans attaquant, la connexion légitime aboutit)"
+cmd "curl -sS -k --connect-to web.lab.local:9703:127.0.0.1:9701 https://web.lab.local:9703/ -o /dev/null -w 'HTTP %{http_code} (verification TLS désactivée par la victime : -k)\n'"
+verdict T12 $? "avec la vérification contournée (-k), la victime se connecte à l'attaquant : vulnérabilité confirmée"
+
+begin T13 "Interception MITM - PKI correctement déployée" "Refus automatique du certificat de l'attaquant par un client qui fait confiance à la racine du labo"
+cmd "curl -sS --cacert $LAB/root/root.pem --connect-to web.lab.local:9703:127.0.0.1:9701 https://web.lab.local:9703/ -o /dev/null"
+r1=$?
+cmd "curl -sS --cacert $LAB/root/root.pem --connect-to web.lab.local:9703:127.0.0.1:9702 https://web.lab.local:9703/ -o /dev/null"
+r2=$?
+if [ $r1 -ne 0 ] && [ $r2 -ne 0 ]; then rc=0; else rc=1; fi
+log "Cas limite (hors protection) : si la FAUSSE AC est installée dans le magasin de confiance du client, l'interception réussit :"
+cmd "curl -sS --cacert $M/rogue-ca.pem --connect-to web.lab.local:9703:127.0.0.1:9702 https://web.lab.local:9703/ -o /dev/null -w 'HTTP %{http_code}\n'"
+verdict T13 $rc "certificat auto-signé et certificat d'une fausse AC refusés (curl code 60) ; la protection vaut seulement tant que le magasin de confiance n'est pas altéré"
+
+# ================================================================ T15 - OCSP avec openssl ocsp (répondeur de l'intermédiaire OpenSSL)
+begin T15b "Révocation et OCSP (répondeur openssl ocsp)" "Statut good avant révocation puis revoked après, avec commandes et sorties brutes"
+emettre_depuis intb ocsp-leaf web.lab.local "DNS:web.lab.local" -days 30; mv "$LAB"/ocsp-leaf.* "$LAB/intb/" 2>/dev/null
+cmd "openssl x509 -in $LAB/intb/ocsp-leaf.pem -noout -serial -ext authorityInfoAccess,crlDistributionPoints"
+cmd "openssl verify -CAfile $LAB/root/root.pem -untrusted $LAB/intb/ca.pem $LAB/intb/ocsp-leaf.pem"
+# certificat de signature OCSP dédié
+nouvelle_cle_csr "$LAB/intb/ocsp-signer" "OCSP Responder Lab"
+openssl ca -batch -config "$LAB/intb/openssl.cnf" -extensions v3_ocsp -notext -in "$LAB/intb/ocsp-signer.csr" -out "$LAB/intb/ocsp-signer.pem" -days 30 2>/dev/null
+# l'intermédiaire doit pouvoir émettre : son DB/clé sont dans intb ; copier le certificat à la place attendue
+demarrer_ocsp(){
+  openssl ocsp -index "$LAB/intb/index.txt" -port 2560 -rsigner "$LAB/intb/ocsp-signer.pem" -rkey "$LAB/intb/ocsp-signer.key" -CA "$LAB/intb/ca.pem" >> "$OUT/ocsp-responder.log" 2>&1 &
+  OCSP_PID=$!; PIDS+=($!); sleep 1.5   # pas de sonde TCP : le répondeur openssl s'arrête sur une requête mal formée
+}
+demarrer_ocsp
+cmd "openssl ocsp -issuer $LAB/intb/ca.pem -cert $LAB/intb/ocsp-leaf.pem -url http://127.0.0.1:2560 -CAfile $LAB/intb/chain.pem -resp_text -noverify | grep -E 'OCSP Response Status|Cert Status|Responder|This Update|ocsp-leaf'"
+cmd "openssl ocsp -issuer $LAB/intb/ca.pem -cert $LAB/intb/ocsp-leaf.pem -url http://127.0.0.1:2560 -CAfile $LAB/intb/chain.pem -VAfile $LAB/intb/ocsp-signer.pem 2>&1 | tail -4"
+avant="$LAST_OUT"
+cmd "openssl ca -config $LAB/intb/openssl.cnf -revoke $LAB/intb/ocsp-leaf.pem -crl_reason keyCompromise"
+cmd "openssl ca -config $LAB/intb/openssl.cnf -gencrl -out $LAB/intb/int.crl"
+log "(le répondeur openssl ocsp est relancé pour relire sa base d'index après la révocation)"
+kill $OCSP_PID 2>/dev/null; sleep 0.5; demarrer_ocsp
+cmd "openssl ocsp -issuer $LAB/intb/ca.pem -cert $LAB/intb/ocsp-leaf.pem -url http://127.0.0.1:2560 -CAfile $LAB/intb/chain.pem -VAfile $LAB/intb/ocsp-signer.pem 2>&1 | tail -4"
+apres="$LAST_OUT"
+if echo "$avant" | grep -q ': good' && echo "$apres" | grep -q ': revoked'; then rc=0; else rc=1; fi
+verdict T15b $rc "même certificat : good avant révocation, revoked après (réponse signée vérifiée avec -VAfile)"
+
+# ================================================================ T15 - OCSP du moteur PKI de Vault (mode complet)
+if [ "$MODE" = full ]; then
+  begin T15 "Révocation via Vault et vérification OCSP (endpoint Vault)" "Statut good puis revoked retourné par le répondeur OCSP intégré de Vault"
+  cmd "openssl x509 -in $LAB/vault-leaf.pem -noout -serial -ext authorityInfoAccess"
+  SER=$(openssl x509 -in "$LAB/vault-leaf.pem" -noout -serial | cut -d= -f2)
+  ocsp_vault(){ openssl ocsp -issuer "$LAB/vault-int.pem" -cert "$LAB/vault-leaf.pem" -reqout "$LAB/req.der" -no_nonce >/dev/null 2>&1
+    curl -s --cacert "$LAB/root/root.pem" -H 'Content-Type: application/ocsp-request' --data-binary @"$LAB/req.der" "$VAULT_ADDR/v1/pki_int/ocsp" -o "$LAB/resp.der"
+    openssl ocsp -respin "$LAB/resp.der" -issuer "$LAB/vault-int.pem" -cert "$LAB/vault-leaf.pem" -CAfile "$LAB/vault-chain.pem" 2>&1 | tail -6; }
+  log "--- avant révocation ---"; avant=$(ocsp_vault); log "$avant"
+  SERH=$(echo "$SER" | sed 's/../&:/g; s/:$//' | tr 'A-F' 'a-f')
+  cmd "vault write pki_int/revoke serial_number=$SERH"
+  log "--- après révocation ---"; apres=$(ocsp_vault); log "$apres"
+  if echo "$avant" | grep -q ': good' && echo "$apres" | grep -q ': revoked'; then rc=0; else rc=1; fi
+  verdict T15 $rc "OCSP Vault : good avant, revoked après (voir requête/réponse brutes ci-dessus)"
+fi
+
+# ================================================================ R01 - révocation de l'AC intermédiaire (par la racine OpenSSL)
+begin R01 "Révocation de l'autorité intermédiaire par la racine" "Seule la racine peut révoquer l'intermédiaire : révocation openssl, nouvelle CRL, publication et vérification"
+log "NOTE : 'vault write pki_int/root/rotate' ne révoque pas le certificat de l'intermédiaire signé par la racine OpenSSL."
+cmd "openssl ca -config $CAROOT -gencrl -out $LAB/root/root.crl"
+cmd "openssl ca -config $LAB/intb/openssl.cnf -gencrl -out $LAB/intb/int.crl"
+cat "$LAB/root/root.crl" "$LAB/intb/int.crl" > "$LAB/crls.pem"
+emettre_depuis intb r01-leaf app.lab.local "DNS:app.lab.local" -days 30; mv "$LAB"/r01-leaf.* "$LAB/intb/" 2>/dev/null
+cmd "openssl ca -config $LAB/intb/openssl.cnf -gencrl -out $LAB/intb/int.crl"
+cat "$LAB/root/root.crl" "$LAB/intb/int.crl" > "$LAB/crls.pem"
+log "--- AVANT révocation de l'intermédiaire (certificat feuille r01-leaf, non révoqué) ---"
+cmd "openssl verify -crl_check_all -CAfile $LAB/root/root.pem -CRLfile $LAB/crls.pem -untrusted $LAB/intb/ca.pem $LAB/intb/r01-leaf.pem"
+avant_rc=$?
+cmd "openssl ca -config $CAROOT -revoke $LAB/intb/ca.pem -crl_reason CACompromise"
+cmd "openssl ca -config $CAROOT -gencrl -out $LAB/root/root.crl"
+cat "$LAB/root/root.crl" "$LAB/intb/int.crl" > "$LAB/crls.pem"
+cmd "openssl crl -in $LAB/root/root.crl -noout -text | grep -E 'Issuer|Last Update|Next Update|Serial Number|Reason|CA Compromise|Revocation Date'"
+mkdir -p "$LAB/pub"; cp "$LAB/root/root.crl" "$LAB/pub/root.crl"; cp "$LAB/intb/int.crl" "$LAB/pub/int.crl"
+python3 -m http.server 8081 --bind 127.0.0.1 --directory "$LAB/pub" > "$OUT/crl-http.log" 2>&1 &
+PIDS+=($!); attendre_port 127.0.0.1 8081
+log "--- Accès des clients au point de distribution de la CRL (extension CDP du certificat intermédiaire) ---"
+cmd "openssl x509 -in $LAB/intb/ca.pem -noout -ext crlDistributionPoints"
+cmd "curl -s --resolve crl.lab.local:8081:127.0.0.1 http://crl.lab.local:8081/root.crl | openssl crl -noout -issuer -lastupdate -nextupdate"
+log "--- APRÈS révocation de l'intermédiaire ---"
+cmd "openssl verify -crl_check_all -CAfile $LAB/root/root.pem -CRLfile $LAB/crls.pem -untrusted $LAB/intb/ca.pem $LAB/intb/r01-leaf.pem"
+if [ $avant_rc -eq 0 ] && echo "$LAST_OUT" | grep -q 'error 23 at 1 depth lookup: certificate revoked'; then rc=0; else rc=1; fi
+verdict R01 $rc "avant : chaîne OK ; après révocation de l'intermédiaire par la racine et nouvelle CRL : 'certificate revoked' (error 23, profondeur 1)"
+LIM="isolation de la racine : dans ce banc la racine est dans le même conteneur que le reste (pas de vrai air-gap) ; Shamir : parts et jeton racine dans un seul fichier ; MITM simulé par redirection (pas d'ARP spoofing) ; cycles de renouvellement accélérés ; charge de test faible ; Grafana/Alertmanager et Terraform (T14) non rejoués."
+log "LIMITES DU BANC : $LIM"
+
+# ---------------------------------------------------------------- artefacts (certificats publics et configurations, jamais de clés privées)
+mkdir -p "$OUT/artefacts"
+cp "$LAB"/root/root.pem "$LAB"/intb/ca.pem "$OUT/artefacts/" 2>/dev/null
+cp "$LAB"/root/openssl.cnf "$OUT/artefacts/openssl-root.cnf" 2>/dev/null
+cp "$LAB"/vault.hcl "$OUT/artefacts/" 2>/dev/null
+cp /etc/letsencrypt/renewal/web.lab.local.conf "$OUT/artefacts/certbot-renewal.conf" 2>/dev/null
+cp /etc/nginx/conf.d/web.conf "$OUT/artefacts/nginx-web.conf" 2>/dev/null
+cp "$LAB"/prom/*.yml "$OUT/artefacts/" 2>/dev/null
+printf '\nLimites du banc : %s\n' "$LIM" >> "$RES"
+echo; echo "===== RÉSUMÉ ====="; cat "$RES"
+exit 0
